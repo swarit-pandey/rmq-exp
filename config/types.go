@@ -19,9 +19,10 @@ type Connection struct {
 }
 
 type Queue struct {
-	Name       string `mapstructure:"name"`
-	Durable    bool   `mapstructure:"durable"`
-	AutoDelete bool   `mapstructure:"autoDelete"`
+	Name        string `mapstructure:"name"`
+	Durable     bool   `mapstructure:"durable"`
+	AutoDelete  bool   `mapstructure:"autoDelete"`
+	ConsumerTag string `mapstructure:"consumerTag"`
 }
 
 type Exchange struct {

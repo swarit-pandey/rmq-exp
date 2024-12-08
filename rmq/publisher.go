@@ -164,7 +164,7 @@ func (p *Publisher) declareExchange() error {
 }
 
 func (p *Publisher) declareQueue() error {
-	queue, err := p.channel.QueueDeclare(
+	queue, err := p.channel.QueueDeclarePassive(
 		p.config.Queue.Name,
 		p.config.Queue.Durable,
 		p.config.Queue.AutoDelete,
