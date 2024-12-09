@@ -6,7 +6,6 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	_ "github.com/accuknox/dev2/api/grpc/v2/summary"
 	"github.com/swarit-pandey/rmq-exp/config"
@@ -22,10 +21,10 @@ func main() {
 	// RabbitMQ Configuration mein ye sab change kar lo apne hisaab se
 	rmqConfig := config.RabbitMQConf{
 		Conection: config.Connection{
-			URL:      "157.245.98.145",
-			Port:     "32236",
-			Username: "<username-daal-lo>",
-			Password: "<password-daal-lo",
+			URL:      "127.0.0.1",
+			Port:     "5672",
+			Username: "admin",
+			Password: "password",
 		},
 		Exchange: config.Exchange{
 			Name:       "summary-v2",
@@ -67,7 +66,10 @@ func main() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	go pipeline.Start(ctx)
+	if err := pipeline.Start(ctx); err != nil {
+		slog.Error("Pipeline failed to start", "error", err)
+		os.Exit(1)
+	}
 
 	slog.Info("Starting stress test",
 		"batchSize", pipelineConfig.BatchSize,
@@ -75,20 +77,8 @@ func main() {
 		"qosCount", rmqConfig.QoS.Count,
 	)
 
-	select {
-	case sig := <-sigChan:
-		slog.Info("Received shutdown signal", "signal", sig)
-		cancel()
-		pipeline.Stop()
-	case <-ctx.Done():
-		slog.Info("Context cancelled")
-	}
-
-	cleanup := time.NewTimer(2 * time.Second)
-	select {
-	case <-cleanup.C:
-		slog.Info("Stress test completed")
-	case <-sigChan:
-		slog.Info("Forced shutdown")
-	}
+	<-sigChan
+	slog.Info("Received shutdown signal")
+	cancel()
+	pipeline.Stop()
 }

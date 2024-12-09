@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -20,99 +20,89 @@ type Publisher struct {
 	config        config.RabbitMQConf
 	connection    *amqp.Connection
 	channel       *amqp.Channel
-	done          chan os.Signal
 	notifyClose   chan *amqp.Error
 	notifyConfirm chan amqp.Confirmation
 	isConnected   bool
-	alive         bool
+	done          chan struct{}
 	routingKey    string
-	mu            sync.Mutex
-	maxRetries    int
+	mu            sync.RWMutex
+	shuttingDown  atomic.Bool
 }
 
 func NewPublisher(conf config.RabbitMQConf, routingKey string) *Publisher {
 	p := &Publisher{
-		config:      conf,
-		done:        make(chan os.Signal, 1),
-		isConnected: false,
-		alive:       true,
-		routingKey:  routingKey,
-		maxRetries:  defaultMaxRetries,
+		config:     conf,
+		routingKey: routingKey,
+		done:       make(chan struct{}),
 	}
 
 	go p.handleReconnection()
 	return p
 }
 
-func (p *Publisher) handleReconnection() error {
-	for p.alive && p.maxRetries > 0 {
-		p.mu.Lock()
-		p.isConnected = false
-		p.mu.Unlock()
+func (p *Publisher) handleReconnection() {
+	backoff := time.Second
 
-		err := p.connect()
-		if err != nil {
-			slog.Error("Failed to connect", "error", err)
-			time.Sleep(5 * time.Second)
-			// p.maxRetries--
-			continue
-		}
-
-		err = p.declareExchange()
-		if err != nil {
-			slog.Error("Failed to declare exchange", "error", err)
-			p.cleanup()
-			time.Sleep(5 * time.Second)
-			// p.maxRetries--
-			continue
-		}
-
-		err = p.declareQueue()
-		if err != nil {
-			slog.Error("Failed to declare queue", "error", err)
-			p.cleanup()
-			time.Sleep(5 * time.Second)
-			// p.maxRetries--
-			continue
-		}
-
-		p.mu.Lock()
-		p.isConnected = true
-		p.mu.Unlock()
-
+	for {
 		select {
 		case <-p.done:
-			p.alive = false
-			return nil
-		case err := <-p.notifyClose:
-			slog.Error("Connection closed", "error", err)
-			continue
+			return
+		default:
+			p.mu.Lock()
+			p.isConnected = false
+			p.mu.Unlock()
+
+			if err := p.connect(); err != nil {
+				slog.Error("Failed to connect", "error", err)
+				time.Sleep(backoff)
+				backoff = min(backoff*2, 30*time.Second)
+				continue
+			}
+
+			if err := p.setup(); err != nil {
+				slog.Error("Failed to setup", "error", err)
+				p.cleanup()
+				time.Sleep(backoff)
+				backoff = min(backoff*2, 30*time.Second)
+				continue
+			}
+
+			backoff = time.Second
+			p.mu.Lock()
+			p.isConnected = true
+			p.mu.Unlock()
+
+			select {
+			case <-p.done:
+				return
+			case err := <-p.notifyClose:
+				slog.Error("Connection closed", "error", err)
+				p.cleanup()
+			}
 		}
 	}
-	return nil
 }
 
-func (p *Publisher) cleanup() {
-	if p.channel != nil {
-		p.channel.Close()
+func (p *Publisher) setup() error {
+	if err := p.declareExchange(); err != nil {
+		return fmt.Errorf("exchange setup failed: %w", err)
 	}
-	if p.connection != nil {
-		p.connection.Close()
+
+	if err := p.declareQueue(); err != nil {
+		return fmt.Errorf("queue setup failed: %w", err)
 	}
+
+	return nil
 }
 
 func (p *Publisher) connect() error {
 	conf := p.config.Conection
 	connStr := fmt.Sprintf("amqp://%s:%s@%s:%s/",
-		conf.Username,
-		conf.Password,
-		conf.URL,
-		conf.Port,
-	)
+		conf.Username, conf.Password, conf.URL, conf.Port)
 
 	conn, err := amqp.Dial(connStr)
 	if err != nil {
-		return fmt.Errorf("failed to connect to rabbitmq: %w", err)
+		return fmt.Errorf("failed to connect: %w", err)
 	}
 
 	ch, err := conn.Channel()
@@ -122,28 +112,26 @@ func (p *Publisher) connect() error {
 	}
 
 	if p.config.QoS.Count > 0 {
-		err = ch.Qos(
+		if err := ch.Qos(
 			p.config.QoS.Count,
 			p.config.QoS.Size,
 			p.config.QoS.Global,
-		)
-		if err != nil {
+		); err != nil {
 			ch.Close()
 			conn.Close()
 			return fmt.Errorf("failed to set QoS: %w", err)
 		}
 	}
 
-	err = ch.Confirm(false)
-	if err != nil {
+	if err := ch.Confirm(false); err != nil {
 		ch.Close()
 		conn.Close()
-		return fmt.Errorf("failed to enable publisher confirms: %w", err)
+		return fmt.Errorf("failed to enable confirms: %w", err)
 	}
 
 	p.connection = conn
 	p.channel = ch
-	p.notifyClose = make(chan *amqp.Error)
+	p.notifyClose = make(chan *amqp.Error, 1)
 	p.notifyConfirm = make(chan amqp.Confirmation, 1)
 	p.channel.NotifyClose(p.notifyClose)
 	p.channel.NotifyPublish(p.notifyConfirm)
@@ -164,7 +152,7 @@ func (p *Publisher) declareExchange() error {
 }
 
 func (p *Publisher) declareQueue() error {
-	queue, err := p.channel.QueueDeclarePassive(
+	queue, err := p.channel.QueueDeclare(
 		p.config.Queue.Name,
 		p.config.Queue.Durable,
 		p.config.Queue.AutoDelete,
@@ -192,9 +180,13 @@ func (p *Publisher) declareQueue() error {
 }
 
 func (p *Publisher) Publish(ctx context.Context, data []byte) error {
-	p.mu.Lock()
+	if p.shuttingDown.Load() {
+		return fmt.Errorf("publisher is shutting down")
+	}
+
+	p.mu.RLock()
 	connected := p.isConnected
-	p.mu.Unlock()
+	p.mu.RUnlock()
 
 	if !connected {
 		return fmt.Errorf("not connected to rabbitmq")
@@ -206,8 +198,12 @@ func (p *Publisher) Publish(ctx context.Context, data []byte) error {
 		Body:         data,
 	}
 
+	// Use a separate context with timeout for publish operation
+	publishCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
 	err := p.channel.PublishWithContext(
-		ctx,
+		publishCtx,
 		p.config.Exchange.Name,
 		p.routingKey,
 		false,
@@ -215,13 +211,13 @@ func (p *Publisher) Publish(ctx context.Context, data []byte) error {
 		msg,
 	)
 	if err != nil {
-		return fmt.Errorf("failed to publish the message: %w", err)
+		return fmt.Errorf("failed to publish: %w", err)
 	}
 
 	select {
 	case confirm := <-p.notifyConfirm:
 		if !confirm.Ack {
-			return fmt.Errorf("failed to deliver message")
+			return fmt.Errorf("publish not confirmed")
 		}
 	case <-ctx.Done():
 		return ctx.Err()
@@ -233,14 +229,42 @@ func (p *Publisher) Publish(ctx context.Context, data []byte) error {
 }
 
 func (p *Publisher) Close() error {
-	p.alive = false
-	p.done <- os.Interrupt
+	p.shuttingDown.Store(true)
+	close(p.done)
+
+	// Give ongoing publishes time to complete
+	select {
+	case <-time.After(3 * time.Second):
+		// Wait
+	}
+
 	p.cleanup()
 	return nil
+}
+
+func (p *Publisher) cleanup() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.channel != nil {
+		p.channel.Close()
+		p.channel = nil
+	}
+	if p.connection != nil {
+		p.connection.Close()
+		p.connection = nil
+	}
 }
 
 func (p *Publisher) IsConnected() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.isConnected
+}
+
+func min(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
 }

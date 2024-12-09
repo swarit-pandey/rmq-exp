@@ -25,6 +25,7 @@ type Pipeline struct {
 	errorCount   uint64
 	done         chan struct{}
 	startTime    time.Time
+	wg           sync.WaitGroup
 }
 
 type PipelineConfig struct {
@@ -70,8 +71,124 @@ func (p *Pipeline) generateBatch() []proto.Message {
 	return batch
 }
 
-func (p *Pipeline) worker(ctx context.Context, id int, messageChan chan proto.Message, wg *sync.WaitGroup) {
-	defer wg.Done()
+func (p *Pipeline) Start(ctx context.Context) error {
+	maxRetries := 30
+	for i := 0; i < maxRetries; i++ {
+		if p.publisher.IsConnected() {
+			break
+		}
+		if i == maxRetries-1 {
+			return fmt.Errorf("failed to connect to RabbitMQ after %d retries", maxRetries)
+		}
+		slog.Info("Waiting for RabbitMQ connection...", "attempt", i+1)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
+
+	p.startTime = time.Now()
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	batchChan := make(chan []proto.Message, p.pipelineConf.BatchQueueSize)
+	messageChan := make(chan proto.Message, p.batchSize*2)
+
+	// Batch generator goroutine
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+		defer close(batchChan)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-p.done:
+				return
+			default:
+				batch := p.generateBatch()
+				select {
+				case batchChan <- batch:
+				case <-ctx.Done():
+					return
+				case <-p.done:
+					return
+				default:
+					slog.Debug("Skipped batch generation - publishers are falling behind")
+				}
+			}
+		}
+	}()
+
+	// Message distributor goroutine
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+		defer close(messageChan)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-p.done:
+				return
+			case batch, ok := <-batchChan:
+				if !ok {
+					return
+				}
+				for _, msg := range batch {
+					select {
+					case messageChan <- msg:
+					case <-ctx.Done():
+						return
+					case <-p.done:
+						return
+					default:
+						slog.Debug("Message channel full, skipping message")
+					}
+				}
+			}
+		}
+	}()
+
+	// Start workers
+	for i := 0; i < p.numWorkers; i++ {
+		p.wg.Add(1)
+		go p.worker(ctx, i, messageChan)
+	}
+
+	// Stats reporting
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-p.done:
+				return
+			case <-ticker.C:
+				elapsed := time.Since(p.startTime).Seconds()
+				published := atomic.LoadUint64(&p.publishCount)
+				errors := atomic.LoadUint64(&p.errorCount)
+				rate := float64(published) / elapsed
+
+				slog.Info("Pipeline stats",
+					"published", published,
+					"errors", errors,
+					"rate", fmt.Sprintf("%.2f msgs/sec", rate),
+					"uptime", fmt.Sprintf("%.0f sec", elapsed),
+					"workers", p.numWorkers,
+				)
+			}
+		}
+	}()
+
+	return nil
+}
+
+func (p *Pipeline) worker(ctx context.Context, id int, messageChan <-chan proto.Message) {
+	defer p.wg.Done()
 
 	for {
 		select {
@@ -102,101 +219,20 @@ func (p *Pipeline) worker(ctx context.Context, id int, messageChan chan proto.Me
 	}
 }
 
-func (p *Pipeline) Start(ctx context.Context) {
-	maxRetries := 30
-	for i := 0; i < maxRetries; i++ {
-		if p.publisher.IsConnected() {
-			break
-		}
-		if i == maxRetries-1 {
-			slog.Error("Failed to connect to RabbitMQ after max retries")
-			return
-		}
-		slog.Info("Waiting for RabbitMQ connection...", "attempt", i+1)
-		time.Sleep(time.Second)
-	}
-
-	p.startTime = time.Now()
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-
-	batchChan := make(chan []proto.Message, p.pipelineConf.BatchQueueSize)
-	messageChan := make(chan proto.Message, p.batchSize*2)
-
-	var wg sync.WaitGroup
-	for i := 0; i < p.numWorkers; i++ {
-		wg.Add(1)
-		go p.worker(ctx, i, messageChan, &wg)
-	}
-
-	go func() {
-		defer close(batchChan)
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-p.done:
-				return
-			default:
-				batch := p.generateBatch()
-				select {
-				case batchChan <- batch:
-					// Batch sent to publishers
-				default:
-					// Channel full, skip this batch
-					slog.Debug("Skipped batch generation - publishers are falling behind")
-				}
-			}
-		}
-	}()
-
-	go func() {
-		defer close(messageChan)
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-p.done:
-				return
-			case batch := <-batchChan:
-				for _, msg := range batch {
-					select {
-					case messageChan <- msg:
-						// Message sent to worker pool
-					default:
-						slog.Debug("Message channel full, skipping message")
-					}
-				}
-			}
-		}
-	}()
-
-	for {
-		select {
-		case <-ctx.Done():
-			wg.Wait()
-			return
-		case <-p.done:
-			wg.Wait()
-			return
-		case <-ticker.C:
-			elapsed := time.Since(p.startTime).Seconds()
-			published := atomic.LoadUint64(&p.publishCount)
-			errors := atomic.LoadUint64(&p.errorCount)
-			rate := float64(published) / elapsed
-
-			slog.Info("Pipeline stats",
-				"published", published,
-				"errors", errors,
-				"rate", fmt.Sprintf("%.2f msgs/sec", rate),
-				"uptime", fmt.Sprintf("%.0f sec", elapsed),
-				"workers", p.numWorkers,
-			)
-		}
-	}
-}
-
 func (p *Pipeline) Stop() {
 	close(p.done)
-	p.publisher.Close()
+
+	stopped := make(chan struct{})
+	go func() {
+		p.wg.Wait()
+		close(stopped)
+	}()
+
+	select {
+	case <-stopped:
+		p.publisher.Close()
+	case <-time.After(3 * time.Second):
+		slog.Warn("Force closing pipeline")
+		p.publisher.Close()
+	}
 }

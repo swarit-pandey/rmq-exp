@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"os"
 	"sync"
 	"time"
 
@@ -16,58 +15,64 @@ type Consumer struct {
 	config      config.RabbitMQConf
 	connection  *amqp.Connection
 	channel     *amqp.Channel
-	done        chan os.Signal
+	done        chan struct{}
 	notifyClose chan *amqp.Error
 	isConnected bool
-	alive       bool
 	bindingKey  string
-	mu          sync.Mutex
-	maxRetries  int
+	mu          sync.RWMutex
 	receiver    <-chan amqp.Delivery
 }
 
 func NewConsumer(conf config.RabbitMQConf, bindingKey string) *Consumer {
 	c := &Consumer{
-		config:      conf,
-		done:        make(chan os.Signal),
-		isConnected: false,
-		alive:       true,
-		bindingKey:  bindingKey,
-		maxRetries:  defaultMaxRetries,
+		config:     conf,
+		done:       make(chan struct{}),
+		bindingKey: bindingKey,
 	}
 
+	go c.handleReconnection()
 	return c
 }
 
 func (c *Consumer) handleReconnection() {
-	for err := range c.notifyClose {
-		if !c.alive {
+	backoff := time.Second
+
+	for {
+		select {
+		case <-c.done:
 			return
-		}
+		default:
+			c.mu.Lock()
+			c.isConnected = false
+			c.mu.Unlock()
 
-		slog.Error("Connection closed", "error", err)
-
-		backoff := time.Second
-		for retry := 0; retry < c.maxRetries; retry++ {
 			if err := c.connect(); err != nil {
-				slog.Error("Failed to reconnect", "attempt", retry+1, "error", err)
+				slog.Error("Failed to connect", "error", err)
 				time.Sleep(backoff)
-				backoff *= 2
+				backoff = min(backoff*2, 30*time.Second)
 				continue
 			}
 
-			if err := c.declareExchange(); err != nil {
-				slog.Error("Failed to declare exchange", "error", err)
+			if err := c.setup(); err != nil {
+				slog.Error("Failed to setup", "error", err)
+				c.cleanup()
+				time.Sleep(backoff)
+				backoff = min(backoff*2, 30*time.Second)
 				continue
 			}
 
-			if err := c.declareQueue(); err != nil {
-				slog.Error("Failed to declare queue", "error", err)
-				continue
-			}
+			backoff = time.Second
+			c.mu.Lock()
+			c.isConnected = true
+			c.mu.Unlock()
 
-			slog.Info("Reconnected successfully")
-			break
+			select {
+			case <-c.done:
+				return
+			case err := <-c.notifyClose:
+				slog.Error("Connection closed", "error", err)
+				c.cleanup()
+			}
 		}
 	}
 }
@@ -120,9 +125,21 @@ func (c *Consumer) connect() error {
 	return nil
 }
 
+func (c *Consumer) setup() error {
+	if err := c.declareExchange(); err != nil {
+		return fmt.Errorf("exchange setup failed: %w", err)
+	}
+
+	if err := c.declareQueue(); err != nil {
+		return fmt.Errorf("queue setup failed: %w", err)
+	}
+
+	return nil
+}
+
 // declareExchange will declare an exchange passively since this is consumer
 func (c *Consumer) declareExchange() error {
-	return c.channel.ExchangeDeclarePassive(
+	return c.channel.ExchangeDeclare(
 		c.config.Exchange.Name,
 		c.config.Exchange.Kind,
 		c.config.Exchange.Durable,
@@ -174,52 +191,58 @@ type Message struct {
 }
 
 func (c *Consumer) Consume(ctx context.Context) (chan Message, error) {
-	c.mu.Lock()
+	c.mu.RLock()
 	connected := c.isConnected
-	c.mu.Unlock()
+	c.mu.RUnlock()
 
 	if !connected {
-		return nil, fmt.Errorf("not connected to reabbitmq")
-	}
-
-	var err error
-	c.receiver, err = c.channel.ConsumeWithContext(ctx,
-		c.config.Queue.Name,
-		c.config.Queue.ConsumerTag,
-		false,
-		false,
-		false,
-		false,
-		nil,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to start consumption from queue %s, with binding key %s: %w", c.config.Queue.Name, c.bindingKey, err)
+		return nil, fmt.Errorf("not connected to rabbitmq")
 	}
 
 	msgChan := make(chan Message)
+
+	deliveries, err := c.channel.Consume(
+		c.config.Queue.Name,
+		"",    // consumer tag
+		false, // auto-ack
+		false, // exclusive
+		false, // no-local
+		false, // no-wait
+		nil,   // args
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to start consuming: %w", err)
+	}
+
 	go func() {
 		defer close(msgChan)
 		for {
 			select {
 			case <-ctx.Done():
-				slog.Info("Context cancelled, stopping consumption")
 				return
-			case msg, ok := <-c.receiver:
+			case delivery, ok := <-deliveries:
 				if !ok {
-					if c.channel.IsClosed() {
-						slog.Error("Channel is closed", "queue", c.config.Queue.Name)
-						return
-					}
+					slog.Error("Delivery channel closed")
+					return
 				}
-
-				msgStruct := Message{}
-				msgStruct.Body = msg.Body
-				msgStruct.Original = &msg
-
-				msgChan <- msgStruct
+				msgChan <- Message{
+					Body:     delivery.Body,
+					Original: &delivery,
+				}
 			}
 		}
 	}()
 
 	return msgChan, nil
+}
+
+func (c *Consumer) Close() {
+	close(c.done)
+	c.cleanup()
+}
+
+func (c *Consumer) IsConnected() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.isConnected
 }

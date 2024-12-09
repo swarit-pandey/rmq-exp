@@ -25,12 +25,12 @@ type Stats struct {
 // protobuf
 
 type Proto struct {
-	source        rmq.Consumer
+	source        *rmq.Consumer
 	controlFactor int
 	stats         *Stats
 }
 
-func NewConsumer(cons rmq.Consumer, cf int) *Proto {
+func NewConsumer(cons *rmq.Consumer, cf int) *Proto {
 	return &Proto{
 		source:        cons,
 		controlFactor: cf,
@@ -38,7 +38,7 @@ func NewConsumer(cons rmq.Consumer, cf int) *Proto {
 	}
 }
 
-func (p *Proto) ProtoMessage(ctx context.Context, messageType ProtoMessage) error {
+func (p *Proto) ProcessMessage(ctx context.Context, messageType ProtoMessage) error {
 	msgChan, err := p.source.Consume(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get the message channel: %w", err)
